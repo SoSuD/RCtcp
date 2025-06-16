@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 	"io"
 	"net"
 	"net/http"
@@ -18,27 +19,23 @@ import (
 
 type server struct {
 	router *gin.Engine
+	logger *zap.Logger
 }
 
 func newServer() *server {
+	logger, err := zap.NewDevelopment() //todo: add config for zap
+
+	if err != nil {
+		panic(err)
+	}
 	return &server{
 		router: gin.Default(),
+		logger: logger,
 	}
 }
 
 func (s *server) configureRouter() {
 	s.router.Use(gin.Recovery())
-	s.router.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
-		return fmt.Sprintf("%s - [%s] \"%s %s %d %d %s \"%s\" \"\n",
-			param.TimeStamp.Format(time.RFC822),
-			param.Method,
-			param.Path,
-			param.Request.Proto,
-			param.StatusCode,
-			param.Latency,
-			param.Request.UserAgent(),
-			param.ErrorMessage)
-	}))
 	s.router.Any("/simpleTCP", s.simpleTCP)
 	s.router.Any("/multiTCP", s.multiTCP)
 }
@@ -52,11 +49,13 @@ type simpleTCPReq struct {
 func (s *server) simpleTCP(c *gin.Context) {
 	var tcp simpleTCPReq
 	if err := c.ShouldBindQuery(&tcp); err != nil {
+		s.logger.Warn("failed to parse query", zap.Error(err))
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	u, err := url.Parse(tcp.NextUrl)
 	if err != nil {
+		s.logger.Warn("failed to parse url", zap.Error(err))
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -67,6 +66,7 @@ func (s *server) simpleTCP(c *gin.Context) {
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%s", u.Host, tcp.Port))
 	if err != nil {
+		s.logger.Error("failed to connect", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -85,11 +85,13 @@ func (s *server) simpleTCP(c *gin.Context) {
 	req, err := requestToTCP.Rtotcp(request)
 	fmt.Println(req)
 	if err != nil {
+		s.logger.Warn("failed to parse request", zap.Error(err))
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
+		s.logger.Warn("failed to send request", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -97,6 +99,7 @@ func (s *server) simpleTCP(c *gin.Context) {
 	br := bufio.NewReader(tlsConn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
+		s.logger.Warn("failed to read response", zap.Error(err))
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
@@ -104,6 +107,7 @@ func (s *server) simpleTCP(c *gin.Context) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		s.logger.Warn("failed to read response body", zap.Error(err))
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
@@ -126,15 +130,18 @@ type multiTCPResp struct {
 func (s *server) multiTCP(c *gin.Context) {
 	var tcp multiTCPReq
 	if err := c.ShouldBindQuery(&tcp); err != nil {
+		s.logger.Warn("failed to parse query", zap.Error(err))
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	u, err := url.Parse(tcp.NextUrl)
 	if err != nil {
+		s.logger.Warn("failed to parse url", zap.Error(err))
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	s.logger.Info("parsed url", zap.String("url", u.Host))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -143,6 +150,7 @@ func (s *server) multiTCP(c *gin.Context) {
 	request.URL.Path = u.Path
 	req, err := requestToTCP.Rtotcp(request)
 	if err != nil {
+		s.logger.Warn("failed to parse request", zap.Error(err))
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -160,8 +168,10 @@ func (s *server) multiTCP(c *gin.Context) {
 			defer wgrecv.Done()
 			dialer := &net.Dialer{}
 			conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%s", u.Host, tcp.Port))
+			s.logger.Debug("connect", zap.String("addr", u.Host), zap.Error(err))
 
 			if err != nil {
+				s.logger.Error("failed to connect", zap.Error(err))
 				reschan <- multiTCPResp{Err: err.Error()}
 				wgsend.Done()
 				return
@@ -173,27 +183,32 @@ func (s *server) multiTCP(c *gin.Context) {
 			defer tlsConn.Close()
 
 			if err := tlsConn.Handshake(); err != nil {
+				s.logger.Error("failed to tls handshake", zap.Error(err))
 				reschan <- multiTCPResp{Err: err.Error()}
 				wgsend.Done()
 				return
 			}
 			if _, err := tlsConn.Write([]byte(reqWithoutChar)); err != nil {
+				s.logger.Error("failed to send request part 1", zap.Error(err))
 				reschan <- multiTCPResp{Err: err.Error()}
 				return
 			}
+			s.logger.Debug("sent request part 1", zap.Int("count", i))
 			wgsend.Done()
 			wgsend.Wait()
 			if _, err := tlsConn.Write([]byte(reqLastChar)); err != nil {
+				s.logger.Error("failed to send request part 2", zap.Error(err))
 				reschan <- multiTCPResp{Err: err.Error()}
 				return
 			}
-			fmt.Println(time.Now().UnixNano())
 			runtime.Gosched()
+			s.logger.Debug("sent request part 2", zap.Int("count", i))
 
 			br := bufio.NewReader(tlsConn) // ① буфер для чтения
 			resp, err := http.ReadResponse(br, nil)
 			// ② парсим HTTP-ответ
 			if err != nil {
+				s.logger.Error("failed to read response", zap.Error(err))
 				reschan <- multiTCPResp{Err: err.Error()}
 				return
 			}
@@ -201,6 +216,7 @@ func (s *server) multiTCP(c *gin.Context) {
 
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
+				s.logger.Error("failed to read response body", zap.Error(err))
 				reschan <- multiTCPResp{Err: err.Error()}
 				return
 			}
