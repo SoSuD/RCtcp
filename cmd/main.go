@@ -5,7 +5,7 @@ import (
 	"log"
 )
 
-func main() {
+func main() { //todo: add configuration
 	if err := apiserver.Start(); err != nil {
 		log.Fatal(err)
 	}
